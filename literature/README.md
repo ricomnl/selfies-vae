@@ -7,7 +7,21 @@
 - experiment: implement minGPT with a couple of layers as a decoder and see how it performs against the LSTM (try GPT for now and if it works well and I want to scale up I can try the T5 implementation or GPT-2, though I think a small GPT should do it)
 - think about: selfies always creates a different alphabet, how would that work with pretraining GPT?
 
+# Wandb
+Selfies-vae: https://wandb.ai/rmeinl/selfies-vae?workspace=user-rmeinl
+Mol-vae: https://wandb.ai/rmeinl/mol-vae?workspace=user-rmeinl
+Selfies-mingpt: https://wandb.ai/rmeinl/selfies-mingpt?workspace=user-rmeinl
+
 # Literature Review
+
+## Datasets to show that the AE learned molecular properties
+- Water solubility: [Delayney](https://deepchem.readthedocs.io/en/latest/api_reference/moleculenet.html#delaney-datasets)
+- Hydration free energies: [Freesolv](https://deepchem.readthedocs.io/en/latest/api_reference/moleculenet.html#freesolv-dataset)
+- Thermodynamic solubility: 
+    - [HPPB](https://deepchem.readthedocs.io/en/latest/api_reference/moleculenet.html#hppb-datasets)
+    - [Thermosol](https://deepchem.readthedocs.io/en/latest/api_reference/moleculenet.html#thermosol-datasets)
+- Liphophilicity: [LIPO](https://deepchem.readthedocs.io/en/latest/api_reference/moleculenet.html#lipo-datasets)
+- Free solvation: [SAMPL](https://deepchem.readthedocs.io/en/latest/api_reference/moleculenet.html#sampl-datasets)
 
 ## Early Visual Concept Learning with Unsupervised Deep Learning
 Link: https://arxiv.org/pdf/1606.05579.pdf
@@ -45,9 +59,14 @@ Github: https://github.com/aspuru-guzik-group/selfies
 
 ## TextRNNVAE
 Github: https://github.com/chrisvdweth/ml-toolkit/blob/master/pytorch/models/text/autoencoder/textrnnvae.py
+- Pytorch guy posted his textrnnvae implementation which I used in mol-vae (molgen)
 
 ## minGPT
 Github: https://github.com/karpathy/minGPT
+
+## LigGPT: Molecular Generation using a Transformer-Decoder Model
+Link: https://chemrxiv.org/engage/api-gateway/chemrxiv/assets/orp/resource/item/60c7588e469df48597f456ae/original/lig-gpt-molecular-generation-using-a-transformer-decoder-model.pdf
+Github: https://github.com/devalab/molgpt
 
 # Tackling the problems of longer sequences
 ## WaveNet

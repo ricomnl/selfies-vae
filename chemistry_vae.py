@@ -41,6 +41,7 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import wandb
 import yaml
 from pathlib import Path
@@ -165,6 +166,99 @@ class VAEDecoder(nn.Module):
         decoded = self.decode_FC(l1)  # fully connected layer
 
         return decoded, hidden
+
+def sample_gumbel(shape, eps=1e-20):
+    U = torch.rand(shape).to(device)
+    return -torch.log(-torch.log(U + eps) + eps)
+
+
+def gumbel_softmax_sample(logits, temperature):
+    y = logits + sample_gumbel(logits.size())
+    return F.softmax(y / temperature, dim=-1)
+
+
+class VAEEncoderGumbel(nn.Module):
+
+    def __init__(self, in_dimension, layer_1d, layer_2d, layer_3d, categorical_dimension, latent_dimension):
+        """
+        Fully Connected layers to encode molecule to latent space
+        """
+        super(VAEEncoderGumbel, self).__init__()
+        self.latent_dimension = latent_dimension
+        self.categorical_dimension = categorical_dimension
+
+        # Reduce dimension up to second last layer of Encoder
+        self.encode_nn = nn.Sequential(
+            nn.Linear(in_dimension, layer_1d),
+            nn.ReLU(),
+            nn.Linear(layer_1d, layer_2d),
+            nn.ReLU(),
+            nn.Linear(layer_2d, layer_3d),
+            nn.ReLU(),
+            nn.Linear(layer_3d, latent_dimension*categorical_dimension),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        """
+        Pass throught the Encoder
+        """
+        # Get results of encoder network
+        q = self.encode_nn(x)
+
+        return q
+
+class VAEDecoderGumbel(nn.Module):
+
+    def __init__(self, latent_dimension, layer_1d, layer_2d, layer_3d, categorical_dimension, out_dimension):
+        """
+        Through Decoder
+        """
+        super(VAEDecoderGumbel, self).__init__()
+        self.latent_dimension = latent_dimension
+        self.categorical_dimension = categorical_dimension
+
+        # Simple Decoder
+        self.decode_nn = nn.Sequential(
+            nn.Linear(latent_dimension*categorical_dimension, layer_3d),
+            nn.ReLU(),
+            nn.Linear(layer_3d, layer_2d),
+            nn.ReLU(),
+            nn.Linear(layer_2d, layer_1d),
+            nn.ReLU(),
+            nn.Linear(layer_1d, out_dimension),
+            nn.Sigmoid()
+        )
+
+    def gumbel_softmax(self, logits, temperature, hard=False):
+        """
+        ST-gumple-softmax
+        input: [*, n_class]
+        return: flatten --> [*, n_class] an one-hot vector
+        """
+        y = gumbel_softmax_sample(logits, temperature)
+        
+        if not hard:
+            return y.view(-1, self.latent_dimension * self.categorical_dimension)
+
+        shape = y.size()
+        _, ind = y.max(dim=-1)
+        y_hard = torch.zeros_like(y).view(-1, shape[-1])
+        y_hard.scatter_(1, ind.view(-1, 1), 1)
+        y_hard = y_hard.view(*shape)
+        # Set gradients w.r.t. y_hard gradients w.r.t. y
+        y_hard = (y_hard - y).detach() + y
+        return y_hard.view(-1, self.latent_dimension * self.categorical_dimension)
+
+    def forward(self, q, temp, hard):
+        """
+        A forward pass throught the entire model.
+        """
+        # Decode
+        q_y = q.view(q.size(0), self.latent_dimension, self.categorical_dimension)
+        z = self.gumbel_softmax(q_y, temp, hard)
+
+        return self.decode_nn(z), F.softmax(q_y, dim=-1).reshape(*q.size())
 
 
 def is_correct_smiles(smiles):
@@ -416,6 +510,145 @@ def train_model(vae_encoder, vae_decoder,
         if epoch > 0 and epoch % 100 == 0:
             save_models(vae_encoder, vae_decoder, epoch)
 
+def train_model_gumbel(vae_encoder, vae_decoder,
+                data_train, data_valid, num_epochs, batch_size,
+                lr_enc, lr_dec,
+                sample_num, sample_len, alphabet, type_of_encoding, categorical_dimension,
+                temp, hard, temp_min, anneal_rate, logger=None):
+    """
+    Train the Variational Auto-Encoder
+    """
+
+    print("num_epochs: ", num_epochs)
+    int_to_symbol = dict((i, c) for i, c in enumerate(alphabet))
+
+    # initialize an instance of the model
+    optimizer_encoder = torch.optim.Adam(vae_encoder.parameters(), lr=lr_enc)
+    optimizer_decoder = torch.optim.Adam(vae_decoder.parameters(), lr=lr_dec)
+
+    data_train = data_train.clone().detach().to(device)
+    num_batches_train = int(len(data_train) / batch_size)
+
+    quality_valid_list = [0, 0, 0, 0]
+    for epoch in range(num_epochs):
+
+        data_train = data_train[torch.randperm(data_train.size()[0])]
+
+        start = time.time()
+        for batch_iteration in range(num_batches_train):  # batch iterator
+
+            # manual batch iterations
+            start_idx = batch_iteration * batch_size
+            stop_idx = (batch_iteration + 1) * batch_size
+            batch = data_train[start_idx: stop_idx]
+
+            # reshaping for efficient parallelization
+            inp_flat_one_hot = batch.flatten(start_dim=1)
+            q = vae_encoder(inp_flat_one_hot)
+
+            out_one_hot, qy = vae_decoder(q, temp, hard)
+
+            # compute ELBO
+            loss = compute_elbo_loss_gumbel(inp_flat_one_hot, out_one_hot, qy, categorical_dimension, logger=logger)
+
+            # perform back propogation
+            optimizer_encoder.zero_grad()
+            optimizer_decoder.zero_grad()
+            loss.backward(retain_graph=True)
+            # TODO: reenable
+            # nn.utils.clip_grad_norm_(vae_decoder.parameters(), 0.5)
+            optimizer_encoder.step()
+            optimizer_decoder.step()
+
+            # TODO: gumbel only
+            if batch_iteration % 100 == 1:
+                temp = np.maximum(temp * np.exp(-anneal_rate * batch_iteration), temp_min)
+
+            if batch_iteration % 30 == 0:
+                end = time.time()
+
+                # assess reconstruction quality
+                # TODO: reset
+                # quality_train = compute_recon_quality(batch, out_one_hot)
+                quality_train = compute_recon_quality(batch, out_one_hot.view(batch.size()))
+                # TODO: reset
+                # quality_valid = quality_in_valid_set(vae_encoder, vae_decoder,
+                #                                      data_valid, batch_size)
+                quality_valid = 0.0
+
+                report = "Epoch: %d,  Batch: %d / %d,\t(loss: %.4f\t| " \
+                         "quality: %.4f | quality_valid: %.4f)\t" \
+                         "ELAPSED TIME: %.5f" \
+                         % (epoch, batch_iteration, num_batches_train,
+                            loss.item(), quality_train, quality_valid,
+                            end - start)
+                print(report)
+
+                # Visualize reconstruction quality
+                target = batch[0]
+                # TODO: reset
+                # generated = out_one_hot[0]
+                generated = out_one_hot[0].view(target.size())
+                target_indices = target.reshape(-1, target.shape[1]).argmax(1)
+                generated_indices = generated.reshape(-1, generated.shape[1]).argmax(1)
+                target_selfies = sf.encoding_to_selfies(np.array(target_indices), int_to_symbol, "label")
+                generated_selfies = sf.encoding_to_selfies(np.array(generated_indices), int_to_symbol, "label")
+                print(f"\nTarget:     {target_selfies}")
+                print(f"Generated:  {generated_selfies}\n")
+
+                if logger:
+                    logger.log({
+                        "loss": loss.item(), 
+                        "quality_train": quality_train, 
+                        "quality_valid": quality_valid,
+                        "predicted": [
+                            wandb.Image(selfies2image(target_selfies), caption=target_selfies),
+                            wandb.Image(selfies2image(generated_selfies), caption=generated_selfies)
+                        ]
+                    })
+
+                start = time.time()
+
+        # TODO: reset
+        # quality_valid = quality_in_valid_set(vae_encoder, vae_decoder,
+        #                                      data_valid, batch_size)
+        quality_valid = 0.0
+        quality_valid_list.append(quality_valid)
+
+        # only measure validity of reconstruction improved
+        quality_increase = len(quality_valid_list) \
+                           - np.argmax(quality_valid_list)
+        if quality_increase == 1 and quality_valid_list[-1] > 50.:
+            corr, unique = latent_space_quality(vae_encoder, vae_decoder,
+                                                type_of_encoding, alphabet,
+                                                sample_num, sample_len)
+        else:
+            corr, unique = -1., -1.
+
+        validity = corr * 100. / sample_num
+        diversity = unique * 100. / sample_num
+        report = "Validity: %.5f %% | Diversity: %.5f %% | " \
+                 "Reconstruction: %.5f %%" \
+                 % (validity, diversity, quality_valid)
+        print(report)
+
+        if logger:
+            logger.log({
+                "validity": validity, 
+                "diversity": diversity,
+            })
+
+        if quality_valid_list[-1] < 70. and epoch > 200:
+            break
+
+        # TODO: reset
+        # if quality_increase > 20:
+        #     print("Early stopping criteria")
+        #     break
+
+        if epoch > 0 and epoch % 100 == 0:
+            save_models(vae_encoder, vae_decoder, epoch)
+
 
 def compute_elbo_loss(x, x_hat, mus, log_vars, KLD_alpha, logger=None):
     inp = x_hat.reshape(-1, x_hat.shape[2])
@@ -432,6 +665,24 @@ def compute_elbo_loss(x, x_hat, mus, log_vars, KLD_alpha, logger=None):
         })
 
     return recon_loss + KLD_alpha * kld
+
+def compute_elbo_loss_gumbel(x, x_hat, qy, categorical_dim, logger=None):
+    # inp = x_hat.reshape(-1, x_hat.shape[2])
+    # target = x.reshape(-1, x.shape[2])
+
+    criterion = torch.nn.BCELoss(size_average=False)
+    recon_loss = criterion(x_hat, x) #/ x.shape[0]
+    
+    log_ratio = torch.log(qy * categorical_dim + 1e-20)
+    kld = torch.sum(qy * log_ratio, dim=-1).mean()
+
+    if logger:
+        logger.log({
+            "reconstruction_loss": recon_loss.item(),
+            "kld": kld.item(),
+        })
+
+    return recon_loss + kld
 
 
 def gaussian_kernel(x, y):
@@ -581,10 +832,15 @@ def main():
     decoder_parameter = settings["decoder"]
     training_parameters = settings["training"]
 
-    vae_encoder = VAEEncoder(in_dimension=len_max_mol_one_hot,
-                             **encoder_parameter).to(device)
-    vae_decoder = VAEDecoder(**decoder_parameter,
-                             out_dimension=len(encoding_alphabet)).to(device)
+    # TODO: reset
+    # vae_encoder = VAEEncoder(in_dimension=len_max_mol_one_hot,
+    #                          **encoder_parameter).to(device)
+    # vae_decoder = VAEDecoder(**decoder_parameter,
+    #                          out_dimension=len(encoding_alphabet)).to(device)
+    vae_encoder = VAEEncoderGumbel(in_dimension=len_max_mol_one_hot, categorical_dimension=len_alphabet,
+                                   **encoder_parameter).to(device)
+    vae_decoder = VAEDecoderGumbel(**encoder_parameter, categorical_dimension=len_alphabet,
+                                   out_dimension=len_max_mol_one_hot).to(device)
 
     # load pretrained model
     # load pretrained model
@@ -618,7 +874,18 @@ def main():
     wandb.watch([vae_encoder, vae_decoder])
 
     print("start training")
-    train_model(**training_parameters,
+    # TODO: reset
+    # train_model(**training_parameters,
+    #             vae_encoder=vae_encoder,
+    #             vae_decoder=vae_decoder,
+    #             batch_size=batch_size,
+    #             data_train=data_train,
+    #             data_valid=data_valid,
+    #             alphabet=encoding_alphabet,
+    #             type_of_encoding=type_of_encoding,
+    #             sample_len=len_max_molec,
+    #             logger=wandb)
+    train_model_gumbel(**training_parameters,
                 vae_encoder=vae_encoder,
                 vae_decoder=vae_decoder,
                 batch_size=batch_size,
@@ -627,6 +894,7 @@ def main():
                 alphabet=encoding_alphabet,
                 type_of_encoding=type_of_encoding,
                 sample_len=len_max_molec,
+                categorical_dimension=len_alphabet,
                 logger=wandb)
 
 
