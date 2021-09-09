@@ -1,6 +1,6 @@
 data:
   batch_size: 100
-  smiles_file: datasets/dataJ_250k_rndm_zinc_drugs_clean.txt
+  smiles_file: datasets/0SelectedSMILES_QM9.txt
   type_of_encoding: 1
 
 decoder:
@@ -20,3 +20,5 @@ training:
   lr_dec: 0.0001
   num_epochs: 5000
   sample_num: 1000
+  dist_criterion: "mmd"
+  # pretrained_model: "QM9"

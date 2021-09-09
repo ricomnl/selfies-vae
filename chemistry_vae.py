@@ -41,17 +41,19 @@ import time
 import numpy as np
 import pandas as pd
 import torch
+import wandb
 import yaml
 from pathlib import Path
 from rdkit import rdBase
 from rdkit.Chem import MolFromSmiles
+from rdkit.Chem import Draw
 from torch import nn
 
 import selfies as sf
 from data_loader import \
     multiple_selfies_to_hot, multiple_smile_to_hot
 
-rdBase.DisableLog('rdApp.error')
+rdBase.DisableLog("rdApp.error")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -61,11 +63,17 @@ def _make_dir(directory):
 
 
 def save_models(encoder, decoder, epoch):
-    out_dir = './saved_models/{}'.format(epoch)
+    out_dir = "./saved_models/{}".format(epoch)
     _make_dir(out_dir)
-    torch.save(encoder, '{}/E'.format(out_dir))
-    torch.save(decoder, '{}/D'.format(out_dir))
+    torch.save(encoder, "{}/E".format(out_dir))
+    torch.save(decoder, "{}/D".format(out_dir))
 
+
+def load_models(epoch):
+    out_dir = "./saved_models/{}".format(epoch)
+    encoder = torch.load("{}/E".format(out_dir))
+    decoder = torch.load("{}/D".format(out_dir))
+    return encoder, decoder
 
 class VAEEncoder(nn.Module):
 
@@ -209,10 +217,10 @@ def latent_space_quality(vae_encoder, vae_decoder, type_of_encoding,
 
     for _ in range(1, sample_num + 1):
 
-        molecule_pre = ''
+        molecule_pre = ""
         for i in sample_latent_space(vae_encoder, vae_decoder, sample_len):
             molecule_pre += alphabet[i]
-        molecule = molecule_pre.replace(' ', '')
+        molecule = molecule_pre.replace(" ", "")
 
         if type_of_encoding == 1:  # if SELFIES, decode to SMILES
             molecule = sf.decoder(molecule)
@@ -254,15 +262,24 @@ def quality_in_valid_set(vae_encoder, vae_decoder, data_valid, batch_size):
     return np.mean(quality_list).item()
 
 
+def selfies2image(s):
+    """
+    Convert a selfies string into a PIL image.
+    """
+    mol = MolFromSmiles(sf.decoder(s), sanitize=True)
+    return Draw.MolToImage(mol)
+
+
 def train_model(vae_encoder, vae_decoder,
                 data_train, data_valid, num_epochs, batch_size,
-                lr_enc, lr_dec, KLD_alpha,
-                sample_num, sample_len, alphabet, type_of_encoding):
+                lr_enc, lr_dec,
+                sample_num, sample_len, alphabet, type_of_encoding, 
+                dist_criterion, KLD_alpha=1.0e-05, logger=None):
     """
     Train the Variational Auto-Encoder
     """
 
-    print('num_epochs: ', num_epochs)
+    print("num_epochs: ", num_epochs)
     int_to_symbol = dict((i, c) for i, c in enumerate(alphabet))
 
     # initialize an instance of the model
@@ -304,8 +321,16 @@ def train_model(vae_encoder, vae_decoder,
                 out_one_hot_line, hidden = vae_decoder(latent_points, hidden)
                 out_one_hot[:, seq_index, :] = out_one_hot_line[0]
 
-            # compute ELBO
-            loss = compute_elbo(batch, out_one_hot, mus, log_vars, KLD_alpha)
+            if dist_criterion == "kld":
+                # compute ELBO
+                loss = compute_elbo_loss(batch, out_one_hot, mus, log_vars, KLD_alpha, logger=logger)
+            elif dist_criterion == "mmd":
+                # compute MMD
+                true_samples = torch.randn(latent_points.size()).to(device)
+                loss = compute_mmd_loss(batch, out_one_hot, true_samples, latent_points, logger=logger)
+            else:
+                print("Invalid distribution criterion.")
+                return
 
             # perform back propogation
             optimizer_encoder.zero_grad()
@@ -323,6 +348,15 @@ def train_model(vae_encoder, vae_decoder,
                 quality_valid = quality_in_valid_set(vae_encoder, vae_decoder,
                                                      data_valid, batch_size)
 
+                report = "Epoch: %d,  Batch: %d / %d,\t(loss: %.4f\t| " \
+                         "quality: %.4f | quality_valid: %.4f)\t" \
+                         "ELAPSED TIME: %.5f" \
+                         % (epoch, batch_iteration, num_batches_train,
+                            loss.item(), quality_train, quality_valid,
+                            end - start)
+                print(report)
+
+                # Visualize reconstruction quality
                 target = batch[0]
                 generated = out_one_hot[0]
                 target_indices = target.reshape(-1, target.shape[1]).argmax(1)
@@ -332,13 +366,17 @@ def train_model(vae_encoder, vae_decoder,
                 print(f"\nTarget:     {target_selfies}")
                 print(f"Generated:  {generated_selfies}\n")
 
-                report = 'Epoch: %d,  Batch: %d / %d,\t(loss: %.4f\t| ' \
-                         'quality: %.4f | quality_valid: %.4f)\t' \
-                         'ELAPSED TIME: %.5f' \
-                         % (epoch, batch_iteration, num_batches_train,
-                            loss.item(), quality_train, quality_valid,
-                            end - start)
-                print(report)
+                if logger:
+                    logger.log({
+                        "loss": loss.item(), 
+                        "quality_train": quality_train, 
+                        "quality_valid": quality_valid,
+                        "predicted": [
+                            wandb.Image(selfies2image(target_selfies), caption=target_selfies),
+                            wandb.Image(selfies2image(generated_selfies), caption=generated_selfies)
+                        ]
+                    })
+
                 start = time.time()
 
         quality_valid = quality_in_valid_set(vae_encoder, vae_decoder,
@@ -355,24 +393,31 @@ def train_model(vae_encoder, vae_decoder,
         else:
             corr, unique = -1., -1.
 
-        report = 'Validity: %.5f %% | Diversity: %.5f %% | ' \
-                 'Reconstruction: %.5f %%' \
-                 % (corr * 100. / sample_num, unique * 100. / sample_num,
-                    quality_valid)
+        validity = corr * 100. / sample_num
+        diversity = unique * 100. / sample_num
+        report = "Validity: %.5f %% | Diversity: %.5f %% | " \
+                 "Reconstruction: %.5f %%" \
+                 % (validity, diversity, quality_valid)
         print(report)
 
-        with open('results.dat', 'a') as content:
-            content.write(report + '\n')
+        if logger:
+            logger.log({
+                "validity": validity, 
+                "diversity": diversity,
+            })
 
         if quality_valid_list[-1] < 70. and epoch > 200:
             break
 
         if quality_increase > 20:
-            print('Early stopping criteria')
+            print("Early stopping criteria")
             break
 
+        if epoch > 0 and epoch % 100 == 0:
+            save_models(vae_encoder, vae_decoder, epoch)
 
-def compute_elbo(x, x_hat, mus, log_vars, KLD_alpha):
+
+def compute_elbo_loss(x, x_hat, mus, log_vars, KLD_alpha, logger=None):
     inp = x_hat.reshape(-1, x_hat.shape[2])
     target = x.reshape(-1, x.shape[2]).argmax(1)
 
@@ -380,7 +425,52 @@ def compute_elbo(x, x_hat, mus, log_vars, KLD_alpha):
     recon_loss = criterion(inp, target)
     kld = -0.5 * torch.mean(1. + log_vars - mus.pow(2) - log_vars.exp())
 
+    if logger:
+        logger.log({
+            "reconstruction_loss": recon_loss.item(),
+            "kld": kld.item(),
+        })
+
     return recon_loss + KLD_alpha * kld
+
+
+def gaussian_kernel(x, y):
+    x_size = x.size(0)
+    y_size = y.size(0)
+    dim = x.size(1)
+    x = x.view(x_size, 1, dim)
+    y = y.view(1, y_size, dim)
+    tiled_x = x.expand(x_size, y_size, dim)
+    tiled_y = y.expand(x_size, y_size, dim)
+    kernel_input = (tiled_x - tiled_y).pow(2).mean(2)/float(dim)
+    return torch.exp(-kernel_input)
+
+
+def compute_mmd(x, y):
+    x = x.squeeze()
+    y = y.squeeze()
+    x_kernel = gaussian_kernel(x, x)
+    y_kernel = gaussian_kernel(y, y)
+    xy_kernel = gaussian_kernel(x, y)
+    mmd = x_kernel.mean() + y_kernel.mean() - 2*xy_kernel.mean()
+    return mmd
+
+
+def compute_mmd_loss(x, x_hat, samples, z, logger=None):
+    inp = x_hat.reshape(-1, x_hat.shape[2])
+    target = x.reshape(-1, x.shape[2]).argmax(1)
+
+    criterion = torch.nn.CrossEntropyLoss()
+    recon_loss = criterion(inp, target)
+    mmd = compute_mmd(samples, z)
+
+    if logger:
+        logger.log({
+            "reconstruction_loss": recon_loss.item(),
+            "mmd": mmd.item(),
+        })
+
+    return recon_loss + mmd
 
 
 def compute_recon_quality(x, x_hat):
@@ -415,32 +505,27 @@ def get_selfie_and_smiles_encodings_for_dataset(file_path):
 
     smiles_list = np.asanyarray(df.smiles)
 
-    smiles_alphabet = list(set(''.join(smiles_list)))
-    smiles_alphabet.append(' ')  # for padding
+    smiles_alphabet = list(set("".join(smiles_list)))
+    smiles_alphabet.append(" ")  # for padding
 
     largest_smiles_len = len(max(smiles_list, key=len))
 
-    print('--> Translating SMILES to SELFIES...')
+    print("--> Translating SMILES to SELFIES...")
     selfies_list = list(map(sf.encoder, smiles_list))
 
     all_selfies_symbols = sf.get_alphabet_from_selfies(selfies_list)
-    all_selfies_symbols.add('[nop]')
+    all_selfies_symbols.add("[nop]")
     selfies_alphabet = list(all_selfies_symbols)
 
     largest_selfies_len = max(sf.len_selfies(s) for s in selfies_list)
 
-    print('Finished translating SMILES to SELFIES.')
+    print("Finished translating SMILES to SELFIES.")
 
     return selfies_list, selfies_alphabet, largest_selfies_len, \
            smiles_list, smiles_alphabet, largest_smiles_len
 
 
 def main():
-    content = open('logfile.dat', 'w')
-    content.close()
-    content = open('results.dat', 'w')
-    content.close()
-
     project_dir = Path(__file__).resolve().parent
     settings_file_path = project_dir.joinpath("settings.yml")
     if os.path.exists(settings_file_path):
@@ -449,31 +534,33 @@ def main():
         print("Expected a file settings.yml but didn't find it.")
         return
 
-    print('--> Acquiring data...')
-    type_of_encoding = settings['data']['type_of_encoding']
-    file_name_smiles = settings['data']['smiles_file']
+    print(f"Using device: {device}")
 
-    print('Finished acquiring data.')
+    print("--> Acquiring data...")
+    type_of_encoding = settings["data"]["type_of_encoding"]
+    file_name_smiles = settings["data"]["smiles_file"]
+
+    print("Finished acquiring data.")
 
     if type_of_encoding == 0:
-        print('Representation: SMILES')
+        print("Representation: SMILES")
         _, _, _, encoding_list, encoding_alphabet, largest_molecule_len = \
             get_selfie_and_smiles_encodings_for_dataset(project_dir.joinpath(file_name_smiles))
 
-        print('--> Creating one-hot encoding...')
+        print("--> Creating one-hot encoding...")
         data = multiple_smile_to_hot(encoding_list, largest_molecule_len,
                                      encoding_alphabet)
-        print('Finished creating one-hot encoding.')
+        print("Finished creating one-hot encoding.")
 
     elif type_of_encoding == 1:
-        print('Representation: SELFIES')
+        print("Representation: SELFIES")
         encoding_list, encoding_alphabet, largest_molecule_len, _, _, _ = \
             get_selfie_and_smiles_encodings_for_dataset(project_dir.joinpath(file_name_smiles))
 
-        print('--> Creating one-hot encoding...')
+        print("--> Creating one-hot encoding...")
         data = multiple_selfies_to_hot(encoding_list, largest_molecule_len,
                                        encoding_alphabet)
-        print('Finished creating one-hot encoding.')
+        print("Finished creating one-hot encoding.")
 
     else:
         print("type_of_encoding not in {0, 1}.")
@@ -483,33 +570,52 @@ def main():
     len_alphabet = data.shape[2]
     len_max_mol_one_hot = len_max_molec * len_alphabet
 
-    print(' ')
+    print(" ")
     print(f"Alphabet has {len_alphabet} letters, "
           f"largest molecule is {len_max_molec} letters.")
 
-    data_parameters = settings['data']
-    batch_size = data_parameters['batch_size']
+    data_parameters = settings["data"]
+    batch_size = data_parameters["batch_size"]
 
-    encoder_parameter = settings['encoder']
-    decoder_parameter = settings['decoder']
-    training_parameters = settings['training']
+    encoder_parameter = settings["encoder"]
+    decoder_parameter = settings["decoder"]
+    training_parameters = settings["training"]
 
     vae_encoder = VAEEncoder(in_dimension=len_max_mol_one_hot,
                              **encoder_parameter).to(device)
     vae_decoder = VAEDecoder(**decoder_parameter,
                              out_dimension=len(encoding_alphabet)).to(device)
 
-    print('*' * 15, ': -->', device)
+    # load pretrained model
+    # load pretrained model
+    if training_parameters.get("pretrained_model"):
+        encoder, decoder = load_models(training_parameters["pretrained_model"])
+        # Filter out unnecessary keys
+        encoder_dict = {k: v for k, v in encoder.state_dict().items() \
+                        if k in vae_encoder.state_dict() \
+                        and encoder.state_dict()[k].size() == vae_encoder.state_dict()[k].size()}
+        decoder_dict = {k: v for k, v in decoder.state_dict().items() \
+                        if k in vae_decoder.state_dict() \
+                        and decoder.state_dict()[k].size() == vae_decoder.state_dict()[k].size()}
+        vae_encoder.load_state_dict(encoder_dict, strict=False)
+        vae_decoder.load_state_dict(decoder_dict, strict=False)
+
+    print("*" * 15, ": -->", device)
 
     data = torch.tensor(data, dtype=torch.float).to(device)
 
     train_valid_test_size = [0.5, 0.5, 0.0]
+    # train_valid_test_size = [0.3, 0.3, 0.0]
     data = data[torch.randperm(data.size()[0])]
     idx_train_val = int(len(data) * train_valid_test_size[0])
     idx_val_test = idx_train_val + int(len(data) * train_valid_test_size[1])
 
     data_train = data[0:idx_train_val]
     data_valid = data[idx_train_val:idx_val_test]
+
+    # set up logger
+    wandb.init(project="selfies-vae", entity="rmeinl", config=settings)
+    wandb.watch([vae_encoder, vae_decoder])
 
     print("start training")
     train_model(**training_parameters,
@@ -520,13 +626,11 @@ def main():
                 data_valid=data_valid,
                 alphabet=encoding_alphabet,
                 type_of_encoding=type_of_encoding,
-                sample_len=len_max_molec)
-
-    with open('COMPLETED', 'w') as content:
-        content.write('exit code: 0')
+                sample_len=len_max_molec,
+                logger=wandb)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         main()
     except AttributeError:
